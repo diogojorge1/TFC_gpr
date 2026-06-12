@@ -32,18 +32,19 @@ def list_image_files(folder, exts=("png", "jpg", "jpeg", "bmp", "tif", "tiff")):
 
 def read_and_preprocess_image(path, img_size=(128, 128)):
     img = imread(path)
+
     if img.ndim == 3:
         img = rgb2gray(img)
-    img = img.astype(np.float32)
 
-    
+    img = img.astype(np.float32)
+    img = resize(img, img_size, anti_aliasing=True).astype(np.float32)
+
+    # Min-Max normalization
     img -= img.min()
-    denom = (img.max() - img.min())
+    denom = img.max() - img.min()
     if denom > 0:
         img /= denom
 
-    
-    img = resize(img, img_size, anti_aliasing=True).astype(np.float32)
     return img
 
 
@@ -51,14 +52,15 @@ def read_and_preprocess_image(path, img_size=(128, 128)):
 # 2) Radon -> sinais 1D (canais = ângulos)
 #    output por imagem: (n_angles, proj_len)
 
-def radon_signals(img2d, n_angles=36, circle=True):
+def radon_signals(img2d, n_angles=60, circle=False):
     theta = np.linspace(0, 180, n_angles, endpoint=False)
-    R = radon(img2d, theta=theta, circle= False)  
-    R = R.T.astype(np.float32)                   
+    R = radon(img2d, theta=theta, circle=circle)
+    R = R.T.astype(np.float32)
 
-    # normalizar por canal (ajuda CSP)
+    # normalização por canal
     R -= R.mean(axis=1, keepdims=True)
     R /= (R.std(axis=1, keepdims=True) + 1e-8)
+
     return R
 
 
@@ -211,26 +213,54 @@ class CSP:
             feats[i] = np.log(var / np.sum(var))
         return feats
 
+class RadonInputNormalizer:
+    """
+    Normaliza os sinais obtidos pela Transformada de Radon.
 
+    A média e o desvio-padrão são calculados apenas no conjunto de treino,
+    evitando data leakage.
+    """
+
+    def __init__(self):
+        self.mean_ = None
+        self.std_ = None
+
+    def fit(self, X):
+        
+        self.mean_ = X.mean(axis=(0, 2), keepdims=True)
+        self.std_ = X.std(axis=(0, 2), keepdims=True) + 1e-8
+        return self
+
+    def transform(self, X):
+        return (X - self.mean_) / self.std_
+
+    def fit_transform(self, X):
+        self.fit(X)
+        return self.transform(X)
 
 # 4) Treino SVM (com split e CV)
 
-def train_csp_svm(X, y, n_csp_components=6, kernel="rbf", C=5.0, gamma="scale", test_size=0.2, seed=42):
-    # split
+def train_csp_svm(X, y, n_csp_components=10, kernel="rbf", C=50, gamma="scale", test_size=0.2, seed=42):
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, stratify=y, random_state=seed
+        X, y,
+        test_size=test_size,
+        stratify=y,
+        random_state=seed
     )
 
-    
+    # CSP
     csp = CSP(n_components=n_csp_components)
     csp.fit(X_tr, y_tr)
+
     F_tr = csp.transform(X_tr)
     F_te = csp.transform(X_te)
 
+    # SVM com normalização dos inputs do classificador
     clf = Pipeline([
         ("scaler", StandardScaler()),
-        ("svm", SVC(kernel=kernel, C=C, gamma=gamma, class_weight="balanced"))
+        ("svm", SVC(kernel=kernel, C=C, gamma=gamma))
     ])
+
     clf.fit(F_tr, y_tr)
     pred = clf.predict(F_te)
 
@@ -238,8 +268,8 @@ def train_csp_svm(X, y, n_csp_components=6, kernel="rbf", C=5.0, gamma="scale", 
     print(confusion_matrix(y_te, pred))
     print(classification_report(y_te, pred, target_names=["non-target", "target"]))
 
-    
     F_all = csp.transform(X)
+
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
     scores = cross_val_score(clf, F_all, y, cv=cv, scoring="f1")
     print(f"F1 (CV 5-fold, aproximado): mean={scores.mean():.3f} std={scores.std():.3f}")
@@ -248,16 +278,14 @@ def train_csp_svm(X, y, n_csp_components=6, kernel="rbf", C=5.0, gamma="scale", 
 
 
 def main():
-    
+
     non_target_dir = "./data/non_target"
     target_dir = "./data/target"
 
-    
     img_size = (128, 128)
-    n_angles = 36
-    circle = True
+    n_angles = 60
+    circle = False
 
-    
     X_mm, y, paths = build_or_load_radon_cache(
         non_target_dir=non_target_dir,
         target_dir=target_dir,
@@ -265,29 +293,28 @@ def main():
         img_size=img_size,
         n_angles=n_angles,
         circle=circle,
-        limit_per_class=None  
+        limit_per_class=None
     )
 
-    
     X = np.asarray(X_mm)
     print(f"[info] X shape = {X.shape} (N, angles, proj_len) | y={y.shape}")
 
-    
     csp, svm = train_csp_svm(
-        X, y,
-        n_csp_components=6,
-        kernel="rbf",
-        C=5.0,
-        gamma="scale",
-        test_size=0.2,
-        seed=42
-    )
+    X, y,
+    n_csp_components=12,
+    kernel="rbf",
+    C=50,
+    gamma="scale",
+    test_size=0.2,
+    seed=42
+)
 
-    # guardar
     os.makedirs("./models", exist_ok=True)
     joblib.dump(csp, "./models/csp.pkl")
     joblib.dump(svm, "./models/svm.pkl")
+
     print("\nModelos guardados em ./models/csp.pkl e ./models/svm.pkl")
+
 
 
 if __name__ == "__main__":
